@@ -27,15 +27,76 @@ const NEW_DB_NAME = process.env.NEW_DB_NAME;
 const MIGRATE_KEY = process.env.MIGRATE_KEY;
 
 const BATCH_SIZE = Number(process.env.BATCH_SIZE || 500);
+const STATUS_LOG_LIMIT = Number(process.env.STATUS_LOG_LIMIT || 120);
+const TELEGRAM_LOG_LIMIT = Number(process.env.TELEGRAM_LOG_LIMIT || 25);
+
+// Optional Telegram bot support.
+// Add these env vars when you want to control migration from Telegram:
+// BOT_TOKEN=123:ABC
+// OWNER_ID=123456789
+// or OWNER_IDS=123456789,987654321
+const BOT_TOKEN = process.env.BOT_TOKEN || "";
+const OWNER_IDS = String(process.env.OWNER_IDS || process.env.OWNER_ID || "")
+  .split(",")
+  .map((x) => x.trim())
+  .filter(Boolean);
+
+let bot = null;
+let telegramReady = false;
 
 let isRunning = false;
 let lastLogs = [];
+let activeTelegramChatId = null;
+
+function splitLongText(text, maxLength = 3900) {
+  const chunks = [];
+  let remaining = String(text || "");
+
+  while (remaining.length > maxLength) {
+    chunks.push(remaining.slice(0, maxLength));
+    remaining = remaining.slice(maxLength);
+  }
+
+  if (remaining.length > 0) chunks.push(remaining);
+  return chunks;
+}
+
+async function sendTelegram(chatId, text) {
+  if (!bot || !chatId) return;
+
+  try {
+    for (const chunk of splitLongText(text)) {
+      await bot.sendMessage(chatId, chunk);
+    }
+  } catch (err) {
+    console.error("Telegram send failed:", err.message);
+  }
+}
+
+function shouldPushTelegramLog(message) {
+  const text = String(message || "");
+
+  return (
+    text.includes("🚀") ||
+    text.includes("🎉") ||
+    text.includes("❌") ||
+    text.includes("📚") ||
+    text.includes("📦") ||
+    text.includes("✅ Done") ||
+    text.includes("DRY RUN") ||
+    text.includes("processed")
+  );
+}
 
 function log(message) {
   const line = `[${new Date().toISOString()}] ${message}`;
   console.log(line);
   lastLogs.push(line);
-  if (lastLogs.length > 300) lastLogs.shift();
+  if (lastLogs.length > 500) lastLogs.shift();
+
+  if (activeTelegramChatId && shouldPushTelegramLog(message)) {
+    sendTelegram(activeTelegramChatId, line);
+  }
 }
 
 function checkKey(req, res) {
@@ -45,6 +106,23 @@ function checkKey(req, res) {
     return false;
   }
   return true;
+}
+
+function isOwner(msg) {
+  if (!msg || !msg.from || OWNER_IDS.length === 0) return false;
+  return OWNER_IDS.includes(String(msg.from.id));
+}
+
+function formatStatus(limit = STATUS_LOG_LIMIT) {
+  return [
+    `Status: ${isRunning ? "RUNNING" : "IDLE"}`,
+    `Mode: NO_DELETE_OVERWRITE_BY_ID`,
+    `Old DB: ${OLD_DB_NAME}`,
+    `New DB: ${NEW_DB_NAME}`,
+    "",
+    "Last logs:",
+    ...lastLogs.slice(-limit),
+  ].join("\n");
 }
 
 async function copyIndexes(oldCol, newCol, collectionName) {
@@ -63,6 +141,21 @@ async function copyIndexes(oldCol, newCol, collectionName) {
       log(`✅ Index ready: ${collectionName}.${name}`);
     } catch (err) {
       log(`⚠️ Index skipped/failed: ${collectionName}.${name} | ${err.message}`);
+    }
+  }
+}
+
+async function ensureCollection(newDb, collectionInfo) {
+  const name = collectionInfo.name;
+
+  try {
+    await newDb.createCollection(name, collectionInfo.options || {});
+    log(`✅ Created collection if missing: ${name}`);
+  } catch (err) {
+    if (err.code === 48 || err.codeName === "NamespaceExists") {
+      log(`ℹ️ Collection already exists: ${name}`);
+    } else {
+      throw err;
     }
   }
 }
@@ -94,16 +187,7 @@ async function copyCollection(oldDb, newDb, collectionInfo, dryRun) {
     return;
   }
 
-  try {
-    await newDb.createCollection(name, collectionInfo.options || {});
-    log(`✅ Created collection if missing: ${name}`);
-  } catch (err) {
-    if (err.code === 48 || err.codeName === "NamespaceExists") {
-      log(`ℹ️ Collection already exists: ${name}`);
-    } else {
-      throw err;
-    }
-  }
+  await ensureCollection(newDb, collectionInfo);
 
   const cursor = oldCol.find({}).batchSize(BATCH_SIZE);
 
@@ -145,16 +229,19 @@ async function copyCollection(oldDb, newDb, collectionInfo, dryRun) {
   log(`✅ Done: ${name}`);
 }
 
-async function runMigration({ dryRun }) {
+async function runMigration({ dryRun, telegramChatId = null }) {
   const oldClient = new MongoClient(OLD_URI);
   const newClient = new MongoClient(NEW_URI);
 
+  activeTelegramChatId = telegramChatId;
+
   try {
     log("🚀 MongoDB migration started");
-    log(`MODE=NO_DELETE_OVERWRITE_BY_ID`);
+    log("MODE=NO_DELETE_OVERWRITE_BY_ID");
     log(`DRY_RUN=${dryRun}`);
     log(`OLD_DB=${OLD_DB_NAME}`);
     log(`NEW_DB=${NEW_DB_NAME}`);
+    log(`BATCH_SIZE=${BATCH_SIZE}`);
 
     await oldClient.connect();
     await newClient.connect();
@@ -179,16 +266,125 @@ async function runMigration({ dryRun }) {
     log(`❌ Migration error: ${err.message}`);
     console.error(err);
   } finally {
-    await oldClient.close();
-    await newClient.close();
+    await oldClient.close().catch(() => {});
+    await newClient.close().catch(() => {});
     isRunning = false;
+    activeTelegramChatId = null;
   }
+}
+
+function startTelegramBotIfConfigured() {
+  if (!BOT_TOKEN || OWNER_IDS.length === 0) {
+    console.log("Telegram bot disabled. Add BOT_TOKEN and OWNER_ID/OWNER_IDS to enable it.");
+    return;
+  }
+
+  let TelegramBot;
+  try {
+    TelegramBot = require("node-telegram-bot-api");
+  } catch (err) {
+    console.error("❌ node-telegram-bot-api package missing.");
+    console.error("Add it to package.json: \"node-telegram-bot-api\": \"^0.66.0\"");
+    return;
+  }
+
+  bot = new TelegramBot(BOT_TOKEN, { polling: true });
+  telegramReady = true;
+
+  console.log("Telegram migration bot started");
+  console.log(`Allowed owner IDs: ${OWNER_IDS.join(", ")}`);
+
+  bot.on("polling_error", (err) => {
+    console.error("Telegram polling error:", err.message);
+  });
+
+  bot.onText(/^\/start$/, async (msg) => {
+    if (!isOwner(msg)) {
+      return sendTelegram(msg.chat.id, "❌ You are not allowed.");
+    }
+
+    return sendTelegram(
+      msg.chat.id,
+      [
+        "MongoDB Migration Bot",
+        "",
+        "Commands:",
+        "/migrate_dry - data မရွှေ့ဘဲ collection/count စစ်မယ်",
+        "/migrate_run YES - တကယ် copy/overwrite လုပ်မယ်",
+        "/status - progress/log ကြည့်မယ်",
+        "",
+        "Mode:",
+        "NEW DB မဖျက်ပါ။ _id တူရင် overwrite, မရှိရင် insert လုပ်ပါမယ်။",
+      ].join("\n")
+    );
+  });
+
+  bot.onText(/^\/help$/, async (msg) => {
+    if (!isOwner(msg)) {
+      return sendTelegram(msg.chat.id, "❌ You are not allowed.");
+    }
+
+    return sendTelegram(
+      msg.chat.id,
+      [
+        "/migrate_dry",
+        "/status",
+        "/migrate_run YES",
+      ].join("\n")
+    );
+  });
+
+  bot.onText(/^\/status$/, async (msg) => {
+    if (!isOwner(msg)) {
+      return sendTelegram(msg.chat.id, "❌ You are not allowed.");
+    }
+
+    return sendTelegram(msg.chat.id, formatStatus(TELEGRAM_LOG_LIMIT));
+  });
+
+  bot.onText(/^\/migrate_dry$/, async (msg) => {
+    if (!isOwner(msg)) {
+      return sendTelegram(msg.chat.id, "❌ You are not allowed.");
+    }
+
+    if (isRunning) {
+      return sendTelegram(msg.chat.id, "🟡 Migration already running. Use /status");
+    }
+
+    isRunning = true;
+    lastLogs = [];
+    await sendTelegram(msg.chat.id, "🟡 DRY RUN started. Use /status to check logs.");
+    runMigration({ dryRun: true, telegramChatId: msg.chat.id });
+  });
+
+  bot.onText(/^\/migrate_run(?:\s+(.+))?$/, async (msg, match) => {
+    if (!isOwner(msg)) {
+      return sendTelegram(msg.chat.id, "❌ You are not allowed.");
+    }
+
+    const confirm = match && String(match[1] || "").trim();
+
+    if (confirm !== "YES") {
+      return sendTelegram(msg.chat.id, "⚠️ တကယ် run ချင်ရင် ဒီလိုရေးပါ:\n/migrate_run YES");
+    }
+
+    if (isRunning) {
+      return sendTelegram(msg.chat.id, "🟡 Migration already running. Use /status");
+    }
+
+    isRunning = true;
+    lastLogs = [];
+    await sendTelegram(msg.chat.id, "🚀 Migration started. Use /status to check logs.");
+    runMigration({ dryRun: false, telegramChatId: msg.chat.id });
+  });
 }
 
 app.get("/", (req, res) => {
   res.send(`
     <h2>MongoDB Migration Web Service</h2>
     <p>Status: ${isRunning ? "RUNNING" : "IDLE"}</p>
+    <p>Mode: NO_DELETE_OVERWRITE_BY_ID</p>
+    <p>Telegram: ${telegramReady ? "ENABLED" : "DISABLED"}</p>
     <p>Use:</p>
     <pre>
 /status?key=YOUR_KEY
@@ -200,15 +396,7 @@ app.get("/", (req, res) => {
 
 app.get("/status", (req, res) => {
   if (!checkKey(req, res)) return;
-
-  res.type("text/plain").send(
-    [
-      `Status: ${isRunning ? "RUNNING" : "IDLE"}`,
-      "",
-      "Last logs:",
-      ...lastLogs.slice(-100),
-    ].join("\n")
-  );
+  res.type("text/plain").send(formatStatus(STATUS_LOG_LIMIT));
 });
 
 app.get("/migrate-dry", async (req, res) => {
@@ -242,6 +430,8 @@ app.get("/migrate-run", async (req, res) => {
 
   res.send("🚀 Migration started. Open /status?key=YOUR_KEY to check logs.");
 });
+
+startTelegramBotIfConfigured();
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Migration web service listening on port ${PORT}`);

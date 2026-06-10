@@ -16,7 +16,48 @@ const NEW_DB_NAME = process.env.NEW_DB_NAME;
 
 const BATCH_SIZE = Number(process.env.BATCH_SIZE || 500);
 const DRY_RUN = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
-const CONFIRM_DROP_NEW_DB = process.env.CONFIRM_DROP_NEW_DB === "YES";
+const SKIP_INDEXES = String(process.env.SKIP_INDEXES || "false").toLowerCase() === "true";
+
+async function copyIndexes(oldCol, newCol, collectionName) {
+  if (SKIP_INDEXES) {
+    console.log(`⏭️ Skip indexes for ${collectionName} because SKIP_INDEXES=true`);
+    return;
+  }
+
+  const indexes = await oldCol.indexes();
+
+  for (const index of indexes) {
+    if (index.name === "_id_") continue;
+
+    const { key, name, v, ns, ...indexOptions } = index;
+
+    try {
+      await newCol.createIndex(key, {
+        ...indexOptions,
+        name,
+      });
+      console.log(`✅ Index ready: ${collectionName}.${name}`);
+    } catch (err) {
+      console.log(`⚠️ Index skipped/failed: ${collectionName}.${name}`);
+      console.log(`Reason: ${err.message}`);
+    }
+  }
+}
+
+async function ensureCollection(newDb, collectionInfo) {
+  const name = collectionInfo.name;
+
+  try {
+    await newDb.createCollection(name, collectionInfo.options || {});
+    console.log(`✅ Created collection if missing: ${name}`);
+  } catch (err) {
+    if (err.code === 48 || err.codeName === "NamespaceExists") {
+      console.log(`ℹ️ Collection already exists: ${name}`);
+    } else {
+      throw err;
+    }
+  }
+}
 
 async function copyCollection(oldDb, newDb, collectionInfo) {
   const name = collectionInfo.name;
@@ -35,72 +76,56 @@ async function copyCollection(oldDb, newDb, collectionInfo) {
   const newCol = newDb.collection(name);
 
   const total = await oldCol.countDocuments({});
-  console.log(`\n📦 Collection: ${name}`);
-  console.log(`📄 Documents: ${total}`);
+
+  console.log("\n----------------------------------------");
+  console.log(`📦 Collection: ${name}`);
+  console.log(`📄 OLD documents: ${total}`);
 
   if (DRY_RUN) {
     console.log("🟡 DRY_RUN=true ဖြစ်လို့ copy မလုပ်သေးပါ");
     return;
   }
 
-  const options = collectionInfo.options || {};
-
-  try {
-    await newDb.createCollection(name, options);
-    console.log(`✅ Created collection: ${name}`);
-  } catch (err) {
-    if (err.codeName === "NamespaceExists" || err.code === 48) {
-      console.log(`ℹ️ Collection already exists: ${name}`);
-    } else {
-      throw err;
-    }
-  }
+  await ensureCollection(newDb, collectionInfo);
 
   const cursor = oldCol.find({}).batchSize(BATCH_SIZE);
 
   let ops = [];
-  let copied = 0;
+  let processed = 0;
 
   for await (const doc of cursor) {
     ops.push({
-      insertOne: {
-        document: doc,
+      replaceOne: {
+        filter: { _id: doc._id },
+        replacement: doc,
+        upsert: true,
       },
     });
 
     if (ops.length >= BATCH_SIZE) {
-      await newCol.bulkWrite(ops, { ordered: false });
-      copied += ops.length;
-      console.log(`✅ Copied: ${copied}/${total}`);
+      const result = await newCol.bulkWrite(ops, { ordered: false });
+      processed += ops.length;
+
+      console.log(
+        `✅ ${name}: ${processed}/${total} processed | matched=${result.matchedCount} modified=${result.modifiedCount} upserted=${result.upsertedCount}`
+      );
+
       ops = [];
     }
   }
 
   if (ops.length > 0) {
-    await newCol.bulkWrite(ops, { ordered: false });
-    copied += ops.length;
+    const result = await newCol.bulkWrite(ops, { ordered: false });
+    processed += ops.length;
+
+    console.log(
+      `✅ ${name}: ${processed}/${total} processed | matched=${result.matchedCount} modified=${result.modifiedCount} upserted=${result.upsertedCount}`
+    );
   }
 
-  console.log(`✅ Data done: ${name} => ${copied}/${total}`);
+  await copyIndexes(oldCol, newCol, name);
 
-  const indexes = await oldCol.indexes();
-
-  for (const index of indexes) {
-    if (index.name === "_id_") continue;
-
-    const { key, name: indexName, v, ns, ...indexOptions } = index;
-
-    try {
-      await newCol.createIndex(key, {
-        ...indexOptions,
-        name: indexName,
-      });
-      console.log(`✅ Index copied: ${name}.${indexName}`);
-    } catch (err) {
-      console.log(`⚠️ Index copy failed: ${name}.${indexName}`);
-      console.log(err.message);
-    }
-  }
+  console.log(`✅ Done: ${name}`);
 }
 
 async function main() {
@@ -108,11 +133,13 @@ async function main() {
   const newClient = new MongoClient(NEW_URI);
 
   try {
-    console.log("🚀 Full MongoDB clone started");
+    console.log("🚀 MongoDB overwrite-copy started");
     console.log(`OLD_DB=${OLD_DB_NAME}`);
     console.log(`NEW_DB=${NEW_DB_NAME}`);
     console.log(`DRY_RUN=${DRY_RUN}`);
-    console.log(`CONFIRM_DROP_NEW_DB=${CONFIRM_DROP_NEW_DB}`);
+    console.log(`BATCH_SIZE=${BATCH_SIZE}`);
+    console.log("MODE=NO_DELETE_OVERWRITE_BY_ID");
+    console.log("✅ NEW DB ထဲကရှိပြီးသား data တွေကို မဖျက်ပါ");
 
     await oldClient.connect();
     await newClient.connect();
@@ -122,38 +149,24 @@ async function main() {
 
     const collections = await oldDb.listCollections({}, { nameOnly: false }).toArray();
 
-    console.log(`\n📚 Found collections: ${collections.length}`);
+    console.log(`\n📚 Found OLD collections: ${collections.length}`);
     for (const c of collections) {
       console.log(`- ${c.name}`);
-    }
-
-    if (DRY_RUN) {
-      console.log("\n🟡 DRY_RUN=true: collection/data count ပဲစစ်ပြီး copy မလုပ်ပါ");
-    } else {
-      if (!CONFIRM_DROP_NEW_DB) {
-        console.error("\n❌ Safety lock active");
-        console.error("တကယ် copy လုပ်ချင်ရင် CONFIRM_DROP_NEW_DB=YES ထားပါ");
-        console.error("ဒါက NEW_DB ထဲက data အဟောင်းတွေကို အရင်ဖျက်ပြီးမှ copy လုပ်မှာပါ");
-        process.exit(1);
-      }
-
-      console.log("\n⚠️ Dropping NEW_DB first...");
-      await newDb.dropDatabase();
-      console.log("✅ NEW_DB dropped/cleaned");
     }
 
     for (const collectionInfo of collections) {
       await copyCollection(oldDb, newDb, collectionInfo);
     }
 
-    console.log("\n🎉 Full MongoDB clone finished");
+    console.log("\n🎉 MongoDB overwrite-copy finished");
+    console.log("✅ NEW DB ထဲက extra data တွေ မဖျက်ထားပါ");
   } catch (err) {
-    console.error("\n❌ Clone error:");
+    console.error("\n❌ Copy error:");
     console.error(err);
     process.exit(1);
   } finally {
-    await oldClient.close();
-    await newClient.close();
+    await oldClient.close().catch(() => {});
+    await newClient.close().catch(() => {});
   }
 }
 
