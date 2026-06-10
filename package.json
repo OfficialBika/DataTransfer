@@ -1,6 +1,9 @@
-"scripts": {
-  "clone-db": "node clone-all-mongo.js"
-},
-"dependencies": {
-  "mongodb": "^6.0.0"
+{
+  "scripts": {
+    "migrate-web": "node migrate-web.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "mongodb": "^6.0.0"
+  }
 }
