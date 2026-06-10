@@ -1,8 +1,19 @@
 {
+  "name": "data-transfer",
+  "version": "2.0.0",
+  "description": "Telegram-controlled MongoDB selected collection transfer service",
+  "main": "index.js",
+  "type": "commonjs",
   "scripts": {
-    "migrate-web": "node migrate-web.js"
+    "start": "node index.js",
+    "migrate-web": "node index.js",
+    "check": "node --check index.js && node --check config.js && node --check services/mongo.js && node --check services/migration.js && node --check services/state.js && node --check bot/telegram.js && node --check web/server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "dependencies": {
+    "dotenv": "^16.4.5",
     "express": "^4.18.2",
     "mongodb": "^6.0.0",
     "node-telegram-bot-api": "^0.66.0"
