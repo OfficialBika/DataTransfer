@@ -1,0 +1,6 @@
+"scripts": {
+  "clone-db": "node clone-all-mongo.js"
+},
+"dependencies": {
+  "mongodb": "^6.0.0"
+}
